@@ -227,6 +227,12 @@ class DB:
             )
             await con.execute(
                 """
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS is_subscription_verified BOOLEAN NOT NULL DEFAULT FALSE;
+                """
+            )
+            await con.execute(
+                """
                 INSERT INTO services(code, title) VALUES
                     ('go', 'Google'),
                     ('tg', 'Telegram'),
@@ -264,6 +270,12 @@ class DB:
     async def user(self, user_id: int) -> Optional[asyncpg.Record]:
         async with self.pool.acquire() as con:
             return await con.fetchrow("SELECT * FROM users WHERE id=$1", user_id)
+    async def is_subscription_verified(self, user_id: int) -> bool:
+        async with self.pool.acquire() as con:
+            return bool(await con.fetchval("SELECT is_subscription_verified FROM users WHERE id=$1", user_id))
+    async def mark_subscription_verified(self, user_id: int) -> None:
+        async with self.pool.acquire() as con:
+            await con.execute("UPDATE users SET is_subscription_verified=TRUE, updated_at=NOW() WHERE id=$1", user_id)
     async def enabled_services(self):
         async with self.pool.acquire() as con:
             return await con.fetch("SELECT code, title FROM services WHERE is_enabled=TRUE ORDER BY title")
@@ -518,11 +530,32 @@ class GrizzlyClient:
                     if title:
                         out[str(k)] = str(title)
         return out
-    async def buy_number(self, service: str, country: str) -> tuple[str, str]:
-        response = await self._request({"action": "getNumber", "service": service, "country": country})
+    async def buy_number(
+        self,
+        service: str,
+        country: Optional[str],
+        max_price: Optional[Decimal] = None,
+        provider_ids: Optional[str] = None,
+        except_provider_ids: Optional[str] = None,
+    ) -> tuple[str, str]:
+        payload: dict[str, Any] = {"action": "getNumber", "service": service}
+        payload["country"] = country if country else "any"
+        if max_price is not None:
+            payload["maxPrice"] = str(max_price)
+        if provider_ids:
+            payload["providerIds"] = provider_ids
+        if except_provider_ids:
+            payload["exceptProviderIds"] = except_provider_ids
+        response = await self._request(payload)
         # Example ACCESS_NUMBER:123456:79990000000
         if not response.startswith("ACCESS_NUMBER"):
-            raise RuntimeError(f"Grizzly buy failed: {response}")
+            known = {
+                "BAD_KEY": "Неверный API-ключ Grizzly (BAD_KEY).",
+                "NO_NUMBERS": "Нет доступных номеров (NO_NUMBERS).",
+                "The service is prohibited for sale by administration": "Сервис запрещён к продаже администрацией.",
+                "SERVICE_UNAVAILABLE_REGION": "Доступ из текущего региона ограничен (SERVICE_UNAVAILABLE_REGION).",
+            }
+            raise RuntimeError(known.get(response, f"Grizzly buy failed: {response}"))
         _, activation_id, number = response.split(":", 2)
         return activation_id, number
     async def get_status(self, activation_id: str) -> tuple[str, Optional[str]]:
@@ -600,6 +633,7 @@ grizzly: GrizzlyClient
 crypto: CryptoPayClient
 active_polling_tasks: dict[int, asyncio.Task] = {}
 RUNTIME_ADMIN_IDS: set[int] = set()
+VERIFIED_SUB_USERS: set[int] = set()
 
 def _parse_admin_ids(raw: str) -> set[int]:
     return {int(x.strip()) for x in (raw or "").split(",") if x.strip().isdigit()}
@@ -613,14 +647,14 @@ def get_bot() -> Bot:
     if bot is None:
         raise RuntimeError("Bot is not initialized. Run main() first.")
     return bot
-MAIN_KB = ReplyKeyboardMarkup(
-    keyboard=[
+def main_kb(user_id: Optional[int] = None) -> ReplyKeyboardMarkup:
+    keyboard = [
         [KeyboardButton(text="📱 Купить номер"), KeyboardButton(text="👤 Профиль")],
         [KeyboardButton(text="📞 Поддержка"), KeyboardButton(text="💰 Баланс")],
-        [KeyboardButton(text="🛠 Админка")],
-    ],
-    resize_keyboard=True,
-)
+    ]
+    if user_id is not None and is_admin(user_id):
+        keyboard.append([KeyboardButton(text="🛠 Админка")])
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 def is_admin(user_id: int) -> bool:
     cfg = get_settings()
     if cfg.owner_chat_id and user_id == cfg.owner_chat_id:
@@ -652,7 +686,6 @@ def profile_inline_kb() -> InlineKeyboardMarkup:
         ]
     )
 
-
 def admin_pricing_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -669,7 +702,6 @@ COUNTRY_RU_MAP = {
 def country_ru(code: str) -> str:
     c = str(code).lower()
     return COUNTRY_RU_MAP.get(c, str(code).upper())
-
 
 COUNTRY_NUMERIC_MAP = {
     "0": "Россия",
@@ -688,7 +720,6 @@ COUNTRY_NUMERIC_MAP = {
     "16": "Великобритания",
 }
 
-
 def human_country_title(code: str, provider_titles: Optional[dict[str, str]] = None) -> str:
     key = str(code)
     title = (provider_titles or {}).get(key) or (provider_titles or {}).get(key.lower())
@@ -697,12 +728,10 @@ def human_country_title(code: str, provider_titles: Optional[dict[str, str]] = N
     if key in COUNTRY_NUMERIC_MAP:
         return COUNTRY_NUMERIC_MAP[key]
     ru = country_ru(key)
-    return ru if not ru.isdigit() else f"Страна {key}"
-
+    return ru if not ru.isdigit() else key
 
 def required_subs_links(raw: Optional[str]) -> list[str]:
     return [x.strip() for x in (raw or "").split(",") if x.strip()][:5]
-
 
 def channel_ref_for_membership(link_or_chat: str) -> Optional[str]:
     value = link_or_chat.strip()
@@ -716,7 +745,6 @@ def channel_ref_for_membership(link_or_chat: str) -> Optional[str]:
         return value
     return None
 
-
 def required_subs_kb(channels: list[str]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for idx, ch in enumerate(channels, start=1):
@@ -729,7 +757,6 @@ def required_subs_kb(channels: list[str]) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text=f"Подписаться {idx}", url=url)])
     rows.append([InlineKeyboardButton(text="✅ Я подписался", callback_data="sub:check")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
 
 def admin_required_subs_manage_kb(channels: list[str]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
@@ -754,8 +781,14 @@ def build_country_items(catalog: dict[str, dict[str, Any]], service_code: str, p
         source_items = sorted(service_block.items()) if isinstance(service_block, dict) else []
 
     for code, raw in source_items:
+        count = raw.get("count", raw.get("qty", 0))
+        try:
+            in_stock = int(str(count)) > 0
+        except Exception:
+            in_stock = str(count).strip() not in {"", "0", "0.0", "None", "none", "False", "false"}
+        if not in_stock:
+            continue
         cost = raw.get("cost", "?")
-        count = raw.get("count", raw.get("qty", "?"))
         region_title = human_country_title(str(code), provider_titles)
         title = f"{region_title} | ${cost} | шт:{count}"
         items.append((str(code), title))
@@ -825,6 +858,11 @@ async def ensure_user(message: Message) -> None:
     )
 
 async def has_required_subscriptions(user_id: int) -> tuple[bool, list[str]]:
+    if user_id in VERIFIED_SUB_USERS:
+        return True, []
+    if await db.is_subscription_verified(user_id):
+        VERIFIED_SUB_USERS.add(user_id)
+        return True, []
     raw = await db.get_app_setting("required_subscriptions")
     if not raw:
         return True, []
@@ -835,14 +873,17 @@ async def has_required_subscriptions(user_id: int) -> tuple[bool, list[str]]:
     for chat in channels:
         chat_ref = channel_ref_for_membership(chat)
         if not chat_ref:
-            missing.append(chat)
+            # Непроверяемые ссылки (invite/private) не блокируют вход.
             continue
         try:
             member = await get_bot().get_chat_member(chat_ref, user_id)
             if member.status in {"left", "kicked"}:
                 missing.append(chat)
-        except Exception:
-            missing.append(chat)
+        except Exception as exc:
+            # Если бот не может проверить подписку технически (нет прав/тип ссылки),
+            # не зацикливаем пользователя на "подпишитесь".
+            logger.warning("Subscription check skipped for %s: %s", chat_ref, exc)
+            continue
     return len(missing) == 0, missing
 
 def vip_info(user_row: asyncpg.Record) -> tuple[bool, Decimal, Decimal]:
@@ -864,11 +905,23 @@ async def cmd_start(message: Message):
             reply_markup=required_subs_kb(missing),
         )
         return
+    VERIFIED_SUB_USERS.add(message.from_user.id)
+    await db.mark_subscription_verified(message.from_user.id)
     me = await db.user(message.from_user.id)
-    await message.answer(
-        "Добро пожаловать в SMS-магазин.\n"
-        f"Ваш баланс: <b>{Decimal(str(me['balance'])):.2f}</b> USDT",
-        reply_markup=MAIN_KB,
+    await message.answer_photo(
+        photo="https://imgur.gg/f/ArQ0tkg",
+        caption=(
+            "Привет, пользователь! 👋\n"
+            "Добро пожаловать в наш SMS-бот. Выбирай, что хочешь.\n\n"
+            "<b>Что умеет бот:</b>\n"
+            "• Покупка виртуальных номеров по странам и сервисам\n"
+            "• Выбор количества и подтверждение покупки\n"
+            "• Автополлинг SMS-кодов\n"
+            "• Пополнение баланса и история заказов\n"
+            "• Поддержка и профиль\n\n"
+            f"Текущий баланс: <b>{Decimal(str(me['balance'])):.2f}</b> USDT"
+        ),
+        reply_markup=main_kb(message.from_user.id),
     )
 @dp.callback_query(F.data == "noop")
 async def cb_noop(cb: CallbackQuery):
@@ -882,6 +935,9 @@ async def show_balance(message: Message):
         "<b>Ваш баланс</b>\n"
         f"Текущий остаток: <b>{balance:.2f} USDT</b>\n"
         f"Купить можно примерно: {int(balance // Decimal('0.15'))} номеров (при цене 0.15)",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="➕ Пополнить баланс", callback_data="topup:start")]]
+        ),
     )
 
 @dp.message(F.text == "👤 Профиль")
@@ -1035,56 +1091,103 @@ async def buy_country_page(cb: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data.startswith("cnt:"))
 async def buy_pick_country(cb: CallbackQuery, state: FSMContext):
     _, service_code, country_code = cb.data.split(":", 2)
-    user_id = cb.from_user.id
-    try:
-        provider_price = await grizzly.get_price(service_code, country_code)
-    except Exception:
-        await cb.answer("Номера недоступны в этой стране сейчас", show_alert=True)
-        return
-    final_price = await db.calculate_price(service_code, provider_price, user_id)
-    order_id = await db.reserve_order(user_id, service_code, country_code, final_price, promo_code=None)
-    if not order_id:
-        text = f"Недостаточно средств. Цена: <b>{final_price:.2f} USDT</b>\nПополните баланс."
-        kb_low = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="➕ Пополнить", callback_data="topup:start")]])
-        if cb.message.photo:
-            await cb.message.edit_caption(caption=text, reply_markup=kb_low)
-        else:
-            await cb.message.edit_text(text, reply_markup=kb_low)
-        await state.clear()
-        await cb.answer()
-        return
-    try:
-        activation_id, number = await grizzly.buy_number(service_code, country_code)
-        await db.set_order_provider(order_id, activation_id, number, provider_price)
-    except Exception as exc:
-        await db.cancel_order(order_id, reason="provider_error")
-        err = str(exc)
-        if "NO_BALANCE" in err.upper() or "NO_MONEY" in err.upper() or "balance" in err.lower():
-            err = "у провайдера Grizzly нулевой баланс (пополните Grizzly API)"
-        text = f"Ошибка при выдаче номера: {err}. Средства возвращены."
-        if cb.message.photo:
-            await cb.message.edit_caption(caption=text)
-        else:
-            await cb.message.edit_text(text)
-        await state.clear()
-        await cb.answer()
-        return
-    task = asyncio.create_task(poll_sms(order_id, user_id))
-    active_polling_tasks[order_id] = task
-    kb = InlineKeyboardMarkup(
+    await state.set_state(BuyState.waiting_country)
+    qty_kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🔁 Получить код ещё раз", callback_data=f"sms:again:{order_id}")],
-            [InlineKeyboardButton(text="❌ Отменить номер", callback_data=f"sms:cancel:{order_id}")],
-            [InlineKeyboardButton(text="🔂 Повторить заказ", callback_data=f"sms:repeat:{service_code}:{country_code}")],
+            [InlineKeyboardButton(text="1", callback_data=f"qty:{service_code}:{country_code}:1"), InlineKeyboardButton(text="2", callback_data=f"qty:{service_code}:{country_code}:2"), InlineKeyboardButton(text="3", callback_data=f"qty:{service_code}:{country_code}:3")],
+            [InlineKeyboardButton(text="4", callback_data=f"qty:{service_code}:{country_code}:4"), InlineKeyboardButton(text="5", callback_data=f"qty:{service_code}:{country_code}:5")],
         ]
     )
-    success_text = "Номер успешно выдан.\n" f"<b>Номер:</b> <code>{number}</code>\n" "Ожидаю SMS-код (до 20 минут)..."
+    text = f"Вы выбрали страну: <b>{country_ru(country_code)}</b>\nВыберите количество номеров:"
     if cb.message.photo:
-        await cb.message.edit_caption(caption=success_text, reply_markup=kb)
+        await cb.message.edit_caption(caption=text, reply_markup=qty_kb)
     else:
-        await cb.message.edit_text(success_text, reply_markup=kb)
-    await state.clear()
+        await cb.message.edit_text(text, reply_markup=qty_kb)
     await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("qty:"))
+async def buy_pick_quantity(cb: CallbackQuery):
+    _, service_code, country_code, qty_raw = cb.data.split(":", 3)
+    qty = max(1, min(5, int(qty_raw)))
+    try:
+        provider_price = await grizzly.get_price(service_code, country_code)
+        final_price = await db.calculate_price(service_code, provider_price, cb.from_user.id)
+    except Exception:
+        await cb.answer("Не удалось рассчитать цену", show_alert=True)
+        return
+    total = final_price * qty
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Подтвердить покупку", callback_data=f"buyconfirm:{service_code}:{country_code}:{qty}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="buyconfirm:cancel")],
+        ]
+    )
+    text = (
+        f"<b>Подтверждение покупки</b>\n"
+        f"Сервис: <b>{service_code.upper()}</b>\n"
+        f"Страна: <b>{country_ru(country_code)}</b>\n"
+        f"Количество: <b>{qty}</b>\n"
+        f"Цена за 1: <b>{final_price:.2f} USDT</b>\n"
+        f"Итого: <b>{total:.2f} USDT</b>"
+    )
+    if cb.message.photo:
+        await cb.message.edit_caption(caption=text, reply_markup=kb)
+    else:
+        await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "buyconfirm:cancel")
+async def buy_confirm_cancel(cb: CallbackQuery):
+    await cb.answer("Покупка отменена")
+    await cb.message.answer("Покупка отменена. Выберите сервис снова.", reply_markup=service_page_kb(0))
+
+
+@dp.callback_query(F.data.startswith("buyconfirm:"))
+async def buy_confirm_apply(cb: CallbackQuery, state: FSMContext):
+    _, service_code, country_code, qty_raw = cb.data.split(":", 3)
+    qty = max(1, min(5, int(qty_raw)))
+    user_id = cb.from_user.id
+    success_count = 0
+    for _ in range(qty):
+        try:
+            provider_price = await grizzly.get_price(service_code, country_code)
+        except Exception:
+            break
+        final_price = await db.calculate_price(service_code, provider_price, user_id)
+        order_id = await db.reserve_order(user_id, service_code, country_code, final_price, promo_code=None)
+        if not order_id:
+            if success_count == 0:
+                text = f"Недостаточно средств. Цена: <b>{final_price:.2f} USDT</b>\nПополните баланс."
+                kb_low = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="➕ Пополнить", callback_data="topup:start")]])
+                await cb.message.answer(text, reply_markup=kb_low)
+            break
+        try:
+            activation_id, number = await grizzly.buy_number(service_code, country_code)
+            await db.set_order_provider(order_id, activation_id, number, provider_price)
+        except Exception as exc:
+            await db.cancel_order(order_id, reason="provider_error")
+            err = str(exc)
+            if "NO_BALANCE" in err.upper() or "NO_MONEY" in err.upper() or "balance" in err.lower():
+                err = "у провайдера Grizzly нулевой баланс (пополните Grizzly API)"
+            await cb.message.answer(f"Ошибка при выдаче номера: {err}. Средства возвращены.")
+            break
+        task = asyncio.create_task(poll_sms(order_id, user_id))
+        active_polling_tasks[order_id] = task
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔁 Получить код ещё раз", callback_data=f"sms:again:{order_id}")],
+                [InlineKeyboardButton(text="❌ Отменить номер", callback_data=f"sms:cancel:{order_id}")],
+                [InlineKeyboardButton(text="🔂 Повторить заказ", callback_data=f"sms:repeat:{service_code}:{country_code}")],
+            ]
+        )
+        success_text = "Номер успешно выдан.\n" f"<b>Номер:</b> <code>{number}</code>\n" "Ожидаю SMS-код (до 20 минут)..."
+        await cb.message.answer(success_text, reply_markup=kb)
+        success_count += 1
+    await state.clear()
+    await cb.answer("Готово")
+
 async def poll_sms(order_id: int, user_id: int):
     deadline = datetime.now(timezone.utc) + timedelta(minutes=20)
     while datetime.now(timezone.utc) < deadline:
@@ -1151,14 +1254,14 @@ async def get_code_again(cb: CallbackQuery):
 async def repeat_order(cb: CallbackQuery, state: FSMContext):
     _, _, service_code, country_code = cb.data.split(":", 3)
     await state.set_state(BuyState.waiting_country)
-    fake_cb = CallbackQuery(
-        id=cb.id,
-        from_user=cb.from_user,
-        chat_instance=cb.chat_instance,
-        message=cb.message,
-        data=f"cnt:{service_code}:{country_code}",
+    qty_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="1", callback_data=f"qty:{service_code}:{country_code}:1"), InlineKeyboardButton(text="2", callback_data=f"qty:{service_code}:{country_code}:2"), InlineKeyboardButton(text="3", callback_data=f"qty:{service_code}:{country_code}:3")],
+            [InlineKeyboardButton(text="4", callback_data=f"qty:{service_code}:{country_code}:4"), InlineKeyboardButton(text="5", callback_data=f"qty:{service_code}:{country_code}:5")],
+        ]
     )
-    await buy_pick_country(fake_cb, state)
+    await cb.message.answer(f"Повтор заказа {service_code.upper()} / {country_ru(country_code)}. Выберите количество:", reply_markup=qty_kb)
+    await cb.answer()
 @dp.message(F.text == "📦 История заказов")
 async def history(message: Message):
     rows = await db.recent_orders(message.from_user.id)
@@ -1254,31 +1357,28 @@ async def admin_pricing(cb: CallbackQuery):
     await cb.message.answer("Раздел цен:", reply_markup=admin_pricing_kb())
     await cb.answer()
 
-
 @dp.callback_query(F.data == "admin:pricing:markup")
 async def admin_pricing_markup(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("Нет доступа", show_alert=True)
         return
-    await cb.message.answer("Глобальная/индивидуальная наценка: используйте global_markup_percent и services.markup_percent")
+    await cb.message.answer("• Глобальная наценка на все сервисы или индивидуально по каждому.\nЭто чтобы изменять цены на все или некоторые сервисы.")
     await cb.answer()
-
 
 @dp.callback_query(F.data == "admin:pricing:toggle")
 async def admin_pricing_toggle(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("Нет доступа", show_alert=True)
         return
-    await cb.message.answer("Скрыть/показать сервис или страну: поля services.is_enabled / countries.is_enabled")
+    await cb.message.answer("• Скрыть / показать отдельный сервис или страну.\nЭто чтобы показывать или скрывать страну или сервис.")
     await cb.answer()
-
 
 @dp.callback_query(F.data == "admin:pricing:blacklist")
 async def admin_pricing_blacklist(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("Нет доступа", show_alert=True)
         return
-    await cb.message.answer("Блэклист стран: отключайте страны с низким качеством через countries.is_enabled=FALSE")
+    await cb.message.answer("• Блэклист стран — убрать страны с низким качеством номеров.\nЭто чтобы убирать некачественные страны.")
     await cb.answer()
 
 @dp.callback_query(F.data == "admin:users")
@@ -1287,7 +1387,87 @@ async def admin_users(cb: CallbackQuery, state: FSMContext):
         await cb.answer("Нет доступа", show_alert=True)
         return
     await state.set_state(AdminState.waiting_user_query)
-    await cb.message.answer("Введите ID или @username пользователя:")
+    await render_admin_users_page(cb.message, page=0)
+    await cb.message.answer("Или введите ID / @username пользователя для поиска:")
+    await cb.answer()
+
+
+async def render_admin_users_page(message: Message, page: int):
+    page_size = 15
+    async with db.pool.acquire() as con:
+        total = int(await con.fetchval("SELECT COUNT(*) FROM users"))
+        offset = max(0, page) * page_size
+        rows = await con.fetch(
+            "SELECT id, username FROM users ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+            page_size,
+            offset,
+        )
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    kb_rows = []
+    for r in rows:
+        uname = f"@{r['username']}" if r['username'] else f"ID {r['id']}"
+        kb_rows.append([InlineKeyboardButton(text=uname, callback_data=f"admin:users:pick:{r['id']}:{page}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"admin:users:pg:{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"admin:users:pg:{page+1}"))
+    kb_rows.append(nav)
+    await message.answer("Выберите пользователя:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+
+
+@dp.callback_query(F.data.startswith("admin:users:pg:"))
+async def admin_users_page(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+    page = int(cb.data.rsplit(":", 1)[1])
+    await render_admin_users_page(cb.message, page)
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("admin:users:pick:"))
+async def admin_users_pick(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+    _, _, _, uid_raw, page_raw = cb.data.split(":", 4)
+    uid = int(uid_raw)
+    page = int(page_raw)
+    async with db.pool.acquire() as con:
+        rec = await con.fetchrow("SELECT * FROM users WHERE id=$1", uid)
+    if not rec:
+        await cb.answer("Пользователь не найден", show_alert=True)
+        return
+    orders = await db.recent_orders(int(rec["id"]), limit=10)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Баланс", callback_data=f"admin:user:baladd:{rec['id']}")],
+        [InlineKeyboardButton(text="➖ Баланс", callback_data=f"admin:user:balsub:{rec['id']}")],
+        [InlineKeyboardButton(text="VIP ON", callback_data=f"admin:user:vipon:{rec['id']}")],
+        [InlineKeyboardButton(text="VIP OFF", callback_data=f"admin:user:vipoff:{rec['id']}")],
+        [InlineKeyboardButton(text="Бан", callback_data=f"admin:user:block:{rec['id']}")],
+        [InlineKeyboardButton(text="Разбан", callback_data=f"admin:user:unblock:{rec['id']}")],
+        [InlineKeyboardButton(text="⬅️ Назад к списку", callback_data=f"admin:users:back:{page}")],
+    ])
+    await cb.message.answer(
+        f"ID: <code>{rec['id']}</code>\n"
+        f"Username: @{rec['username'] or '-'}\n"
+        f"Баланс: {Decimal(str(rec['balance'])):.2f}\n"
+        f"История заказов (10): {len(orders)}",
+        reply_markup=kb,
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("admin:users:back:"))
+async def admin_users_back(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+    page = int(cb.data.rsplit(":", 1)[1])
+    await render_admin_users_page(cb.message, page)
     await cb.answer()
 @dp.callback_query(F.data == "admin:stats")
 async def admin_stats(cb: CallbackQuery):
@@ -1342,6 +1522,7 @@ async def admin_user_lookup(message: Message, state: FSMContext):
         [InlineKeyboardButton(text="VIP OFF", callback_data=f"admin:user:vipoff:{rec['id']}")],
         [InlineKeyboardButton(text="Блок", callback_data=f"admin:user:block:{rec['id']}")],
         [InlineKeyboardButton(text="Разблок", callback_data=f"admin:user:unblock:{rec['id']}")],
+        [InlineKeyboardButton(text="⬅️ Назад к списку", callback_data="admin:users:back:0")],
     ])
     await message.answer(
         f"ID: <code>{rec['id']}</code>\n"
@@ -1391,7 +1572,6 @@ async def admin_required_subs_add_start(cb: CallbackQuery, state: FSMContext):
     await cb.message.answer("Пришлите ссылку канала/группы (https://... или @username)")
     await cb.answer()
 
-
 @dp.message(AdminState.waiting_required_subs_add)
 async def admin_required_subs_add_save(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -1408,7 +1588,6 @@ async def admin_required_subs_add_save(message: Message, state: FSMContext):
     await message.answer("Ссылка добавлена", reply_markup=admin_required_subs_manage_kb(channels))
     await state.clear()
 
-
 @dp.callback_query(F.data.startswith("admin:reqsub:del:"))
 async def admin_required_subs_del(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
@@ -1422,7 +1601,6 @@ async def admin_required_subs_del(cb: CallbackQuery):
     await cb.message.answer("Обновлено", reply_markup=admin_required_subs_manage_kb(channels))
     await cb.answer()
 
-
 @dp.callback_query(F.data == "admin:reqsub:clear")
 async def admin_required_subs_clear(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
@@ -1431,7 +1609,6 @@ async def admin_required_subs_clear(cb: CallbackQuery):
     await db.set_app_setting("required_subscriptions", "")
     await cb.message.answer("Обязательная подписка очищена", reply_markup=admin_required_subs_manage_kb([]))
     await cb.answer()
-
 
 @dp.message(AdminState.waiting_required_subs)
 async def admin_required_subs_save_legacy(message: Message, state: FSMContext):
@@ -1445,12 +1622,19 @@ async def admin_required_subs_save_legacy(message: Message, state: FSMContext):
     await state.clear()
 
 @dp.callback_query(F.data.startswith("admin:user:"))
-async def admin_user_action(cb: CallbackQuery):
+async def admin_user_action(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id):
         await cb.answer("Нет доступа", show_alert=True)
         return
     _, _, action, uid = cb.data.split(":", 3)
     user_id = int(uid)
+    if action in {"baladd", "balsub"}:
+        await state.set_state(AdminState.waiting_balance_edit)
+        await state.update_data(target_user_id=user_id, balance_action=action)
+        prompt = "Введите баланс для пользователя:" if action == "baladd" else "Введите сумму списания для пользователя:"
+        await cb.message.answer(prompt)
+        await cb.answer()
+        return
     async with db.pool.acquire() as con:
         if action == "vipon":
             await con.execute("UPDATE users SET vip_until=NOW() + INTERVAL '3650 days' WHERE id=$1", user_id)
@@ -1465,8 +1649,38 @@ async def admin_user_action(cb: CallbackQuery):
             await con.execute("UPDATE users SET is_blocked=FALSE WHERE id=$1", user_id)
             await cb.message.answer("Пользователь разблокирован")
         else:
-            await cb.message.answer("Изменение баланса используйте через SQL/MVP")
+            await cb.message.answer("Неизвестное действие")
     await cb.answer()
+
+
+@dp.message(AdminState.waiting_balance_edit)
+async def admin_balance_edit_apply(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    data = await state.get_data()
+    user_id = int(data.get("target_user_id", 0))
+    action = str(data.get("balance_action", ""))
+    try:
+        amount = Decimal(message.text.strip().replace(",", "."))
+        if amount <= 0:
+            raise ValueError
+    except Exception:
+        await message.answer("Введите корректную сумму, например: 10 или 15.5")
+        return
+    delta = amount if action == "baladd" else -amount
+    await db.add_balance(
+        user_id,
+        delta,
+        "admin_balance_edit",
+        f"admin:{message.from_user.id}",
+        {"action": action},
+    )
+    user = await db.user(user_id)
+    await message.answer(
+        f"Готово. Пользователь <code>{user_id}</code>, новый баланс: <b>{Decimal(str(user['balance'])):.2f}</b> USDT"
+    )
+    await state.clear()
 @dp.callback_query(F.data == "admin:add_admin")
 async def admin_add_admin_start(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id):
@@ -1491,21 +1705,25 @@ async def admin_add_admin_save(message: Message, state: FSMContext):
     await message.answer(f"Администратор {new_id} добавлен")
     await state.clear()
 
-
 @dp.callback_query(F.data == "admin:remove_admin")
 async def admin_remove_admin_menu(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         await cb.answer("Нет доступа", show_alert=True)
         return
     ids = sorted(RUNTIME_ADMIN_IDS)
-    rows = [[InlineKeyboardButton(text=str(x), callback_data=f"admin:remove_admin:{x}")] for x in ids]
+    async with db.pool.acquire() as con:
+        users = await con.fetch("SELECT id, username FROM users WHERE id = ANY($1::bigint[])", ids or [0])
+    uname_by_id = {int(r['id']): (f"@{r['username']}" if r['username'] else None) for r in users}
+    rows = []
+    for x in ids:
+        label = uname_by_id.get(int(x)) or f"ID {x}"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"admin:remove_admin:{x}")])
     if not rows:
         await cb.message.answer("Список админов пуст")
         await cb.answer()
         return
     await cb.message.answer("Выберите администратора для удаления:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await cb.answer()
-
 
 @dp.callback_query(F.data.startswith("admin:remove_admin:"))
 async def admin_remove_admin_apply(cb: CallbackQuery):
@@ -1584,9 +1802,16 @@ async def faq(message: Message):
     )
 @dp.message(F.text == "📞 Поддержка")
 async def support(message: Message):
+    support_ref = get_settings().support_username.strip()
+    support_url = support_ref
+    if support_ref.startswith("@"):
+        support_url = f"https://t.me/{support_ref[1:]}"
     await message.answer(
         "<b>Поддержка</b>\n"
-        f"Связь: {get_settings().support_username}"
+        f"Связь: {support_ref}",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="✉️ Написать в поддержку", url=support_url)]]
+        ),
     )
 @dp.message(F.text.startswith("SUPPORT:"))
 async def support_passthrough(message: Message):
@@ -1753,10 +1978,22 @@ async def sub_check(cb: CallbackQuery):
         )
         await cb.answer("Проверка не пройдена", show_alert=True)
         return
+    VERIFIED_SUB_USERS.add(cb.from_user.id)
+    await db.mark_subscription_verified(cb.from_user.id)
     me = await db.user(cb.from_user.id)
-    await cb.message.answer(
-        "Добро пожаловать в SMS-магазин.\n"
-        f"Ваш баланс: <b>{Decimal(str(me['balance'])):.2f}</b> USDT",
-        reply_markup=MAIN_KB,
+    await cb.message.answer_photo(
+        photo="https://imgur.gg/f/ArQ0tkg",
+        caption=(
+            "Привет, пользователь! 👋\n"
+            "Добро пожаловать в наш SMS-бот. Выбирай, что хочешь.\n\n"
+            "<b>Что умеет бот:</b>\n"
+            "• Покупка виртуальных номеров по странам и сервисам\n"
+            "• Выбор количества и подтверждение покупки\n"
+            "• Автополлинг SMS-кодов\n"
+            "• Пополнение баланса и история заказов\n"
+            "• Поддержка и профиль\n\n"
+            f"Текущий баланс: <b>{Decimal(str(me['balance'])):.2f}</b> USDT"
+        ),
+        reply_markup=main_kb(cb.from_user.id),
     )
-    await cb.answer("Доступ открыт")
+    await cb.answer("Доступ открыт")ы
